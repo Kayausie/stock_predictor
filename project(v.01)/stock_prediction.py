@@ -21,9 +21,12 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import pandas_datareader as web
 import datetime as dt
+from sklearn import preprocessing
 import tensorflow as tf
+from collections import deque
 from sklearn.metrics import mean_absolute_error
-
+import sklearn.metrics as metrics
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, Dropout, LSTM, InputLayer
@@ -38,6 +41,8 @@ from tensorflow.keras.layers import Dense, Dropout, LSTM, InputLayer
 # DATA_SOURCE = "yahoo"
 COMPANY = 'AMZN'
 
+PREDICTION_DAYS = 60 # Number of days to look back to base the prediction
+
 TRAIN_START = '2020-01-01'     # Start date to read
 TRAIN_END = '2023-08-01'       # End date to read
 
@@ -45,10 +50,197 @@ TRAIN_END = '2023-08-01'       # End date to read
 
 
 import yfinance as yf
+#TASKC.2: Writing a function to process the data
+#First of all, we need to define a function to shuffle the dataset, this function will be used later on in our main process_data function. 
+#Our function will take in two arrays a and b, and shuffle them but still keeps the corrensponding relationship between the elements. doing this will allow
+#us to mix up the order of the training data, which is important for training a good model.
+def shuffle_in_unison(a, b):
+    # in the first line, we are going to create a random state using numpy's random get_state function
+    # this state will be used to ensure that we shuffle both arrays in the same way
+    state = np.random.get_state()
+    #shuffle the first array
+    np.random.shuffle(a)
+    #set the random state back for the second array
+    np.random.set_state(state)
+    #this shuffle will be the same as the first one, as they shared the same random state
+    np.random.shuffle(b)
+# Now we will move to our main function process_data, this function will take in a stock ticker, start and end date for the data we want to load, furthermore 
+#also params such as shuffle, store, split_by_date, test_ratio
+def process_data(ticker,startDate, endDate, test_ratio, scale=True, split_by_date=True,shuffle=True,store=True,
+                 feature_columns=['Close', 'Volume', 'Open', 'High', 'Low'], nan_strategy="drop"
+                 , n_steps=50, lookup_step=1):
+    # create a dictionary to store the result
+    result = {}
+    #Check if startDate and endDate are provided, otherwise
+    #it will raise an exception
+    if startDate is None or endDate is None:
+        raise Exception("Please provide a start date and end date in the format YYYY-MM-DD")
+    #nan_strategy (how to deal with NaN values): drop, ffill, bfill. If the param passed is not one of these 3, raise an error
+    # I will explain these 3 strategies more in detail later on
+    if nan_strategy not in ["drop", "ffill", "bfill"]:
+        raise ValueError("nan_strategy must be one of: 'drop', 'ffill', 'bfill'")
+    #Load data from Yahoo Finance: if ticker is a string, load data from Yahoo Finance, otherwise if a DataFrame, use it directly, or raise an error if neither
+    if isinstance(ticker, str):
+        #download the data using yfinance library
+        data = yf.download(ticker, startDate, endDate)
+    elif isinstance(ticker, pd.DataFrame):
+        # use loaded data directly otherwise
+        data = ticker
+    else:
+        raise TypeError("ticker can be either a str or a `pd.DataFrame` instances")
+    #Deal with NaN values first: drop(drop entire row if there is nan value), or forward fill, or backward fill
+    if nan_strategy == "drop":
+        # Drop any row that has a NaN in ANY of the selected feature columns
+        data.dropna(inplace=True)
+    elif nan_strategy in ("ffill", "bfill"):
+        # Forward or backward fill only the feature columns
+        # For example, if we have a dataframe like this:
+        # index       A  B  C
+        # 0           1  2  3
+        # 1           4  NaN 6 , we can see that column B has a NaN value in row 1
+        # if we do a forward fill, the NaN will be filled with the value from the previous row, which is 2
+        # so the dataframe will become:
+        # index       A  B  C
+        # 0           1  2  3
+        # 1           4  2  6 ( value changed from NaN to 2)
+        # if we do a backward fill, the NaN will be filled with the value from the next row, which is 7
+        # so the dataframe will become:
+        # index   A  B  C
+        # 0       1  7  3
+        # 1       4  7  6 (value changed from NaN to 7)
+        method = nan_strategy
+        # fill NaN values only in the feature columns
+        data[feature_columns] = data[feature_columns].fillna(method=method)
+    #save a copy of the original dataframe
+    result['df'] = data.copy()
+    #store the data in a csv file if store param i set to True, default is True
+    if store:
+        data.to_csv("data.csv", index=True) # Save a copy of the original data
+    # add date as a column
+    if "date" not in data.columns:
+        # in Yfinance, the date is the index of the dataframe, so we need to reset the index to make it a column
+        data["date"] = data.index
+    #scale the data (prices) from 0 to 1 if scale param is set to True, default is True
+    if scale:
+        # initialize the scaler
+        column_scaler = {}
+        # scale the data (prices) from 0 to 1 for all feature columns
+        for column in feature_columns:
+            # in this part, we are using MinMaxScaler from sklearn to scale the data
+            # Using scaler will help us scale down the data to a range of 0 to 1, which will help the model to converge faster
+            # for example, if we have a column with values ranging from 100 to 1000, the model will have a hard time learning the patterns in the data
+            # because the values are too large, but if we scale it down to a range of 0 to 1, the model will have an easier time learning the patterns
+            # Imagine we have a dataset: 1000, 2000, 3000, 4000, 5000
+            # but with provided MinMaxScaler from 0 to 1, it will be transformed to: 0, 0.25, 0.5, 0.75, 1
+            scaler = preprocessing.MinMaxScaler(feature_range=(0, 1))
+            #scale the column and save the scaler
+            data[column] = scaler.fit_transform(data[column])
+            column_scaler[column] = scaler
 
+        # add the MinMaxScaler instances to the result returned
+        result["column_scaler"] = column_scaler
+
+     # add the target column (future) by shifting by `lookup_step`
+     # for example, our lookup step is 2, and our open column in chronological order is: 4, 2, 3, 1, 2
+     # then our future column will be: 3, 1, 2, NaN, NaN (shifted by 2), as we have shifted the whole column up by 2, and append it to be another new column
+     # Apparentlym the last 2 rows will be NaN as there is no data for them, so you will see a line which we will drop these NaN values later on
+    data['Future'] = data['Open'].shift(-lookup_step)
+    # Before that, we need to save the last `lookup_step` sequence for future testing
+    last_sequence = np.array(data[feature_columns].tail(lookup_step))
+    
+    # drop NaNs
+    data.dropna(inplace=True)
+    # After this step, we have finished some basic data preprocessing steps,
+    # now we will deal with splitting the data to training and testing sets
+    # first, we will initialize a list to hold all the sequences with n_steps length, accompanied with the target value
+    sequence_data = []
+    # initialize a deque to hold the past maximumly n_steps of data
+    sequences = deque(maxlen=n_steps)
+    # Now, we will loop through the data and create sequences of n_steps length
+    # right here, we use zip to combine the feature columns and the future column together, for example one of the record will look like:
+    # [131, 123, 182,192,800980, "2020-01-01"], 132. The first part is the feature columns with one value of date, and the second part is the target value
+    for entry, target in zip(data[feature_columns + ["date"]].values, data['future'].values):
+        #save the sequence with length of 60 first to the sequences deque
+        sequences.append(entry)
+        if len(sequences) == n_steps:
+            # if the length of the sequences is equal to n_steps, we will append the sequence and the target to the sequence_data list
+            # Using deque will allow us to do both FIFO or LIFO, so if we append a new item, the oldest item will be removed automatically
+            sequence_data.append([np.array(sequences), target])
+
+    # get the last sequence by appending the last `n_step` sequence with `lookup_step` sequence
+    # for instance, if n_steps=50 and lookup_step=10, last_sequence should be of 60 (that is 50+10) length
+    # this last_sequence will be used to predict future stock prices that are not available in the dataset
+    last_sequence = list([s[:len(feature_columns)] for s in sequences]) + list(last_sequence)
+    last_sequence = np.array(last_sequence).astype(np.float32)
+    # this is the last sequence we will use to predict the future stock price that we will store it in the result dictionary
+    result['last_sequence'] = last_sequence
+    
+    # construct the X's and y's
+    X, y = [], []
+    # append all the sequences and targets to the X and y lists
+    for seq, target in sequence_data:
+        X.append(seq)
+        y.append(target)
+
+    # convert to numpy arrays
+    X = np.array(X)
+    y = np.array(y)
+    # if split_by_date param is set to True, we will split the data by date, ;
+    # otherwise we will split it randomly
+    if split_by_date:
+        # split the dataset into training & testing sets by date (not randomly splitting)
+        # Right here, we split the data by calculating the number of training samples based on the test_ratio param
+        # Doing so, will enable all training data to be before the testing data in chronological order
+        train_samples = int((1 - test_ratio) * len(X))
+        # Let's say train samples is 800, then the following line will get the first 800 samples as training data
+        result["X_train"] = X[:train_samples]
+        # similarly, the following line will get the first 800 target values as training target values
+        result["y_train"] = y[:train_samples]
+        # the following line will get the remaining samples as testing data
+        result["X_test"]  = X[train_samples:]
+        # similarly as above 
+        result["y_test"]  = y[train_samples:]
+        # if you choose shuffle to be true, we'll shuffle the training and testing data
+        if shuffle:
+            # shuffle the datasets for training (if shuffle parameter is set)
+            shuffle_in_unison(result["X_train"], result["y_train"])
+            shuffle_in_unison(result["X_test"], result["y_test"])
+    else:    
+        # split the dataset randomly, and divide it as per the test_ratio param
+        # for example, if test_ratio is 0.2, then 20% of the data will be used as testing data, and the rest 80% as training data
+        result["X_train"], result["X_test"], result["y_train"], result["y_test"] = train_test_split(X, y, 
+                                                                                test_size=test_ratio, shuffle=shuffle)
+
+    # get the list of test set dates
+    # right here, result[X_test] is a 3D array, which we have converted earlier
+    # it is as a format of : [number of samples, n_steps, number of features + 1 (date) 
+    # for example: ([123,234,123,432,654], [234,123,432,654,876], ... ,[345,456,567,678,789]) ( 5 records)
+    # this is an array of 5 samples ( record), each sample has 5 timesteps, and each timestep has 1 feature
+    # for the following line, we will get all samples (:), the last timestep (-1), and the last column (-1) which is the date
+    dates = result["X_test"][:, -1, -1]
+    # retrieve test features from the original dataframe
+    result["test_df"] = result["df"].loc[dates]
+    # remove duplicated dates in the testing dataframe
+    # result["test_df"].index.duplicated will return a boolean array, which is True for duplicated dates, and False for unique dates
+    # Then, the "~" operator will invert the boolean array, so that we get True for unique dates, and False for duplicated dates
+    # so after that, result["test_df"] will only keep the rows with unique dates, as these values are True in the boolean array
+    result["test_df"] = result["test_df"][~result["test_df"].index.duplicated(keep='first')]
+    # remove dates from the training/testing sets & convert to float32
+    result["X_train"] = result["X_train"][:, :, :len(feature_columns)].astype(np.float32)
+    result["X_test"] = result["X_test"][:, :, :len(feature_columns)].astype(np.float32)
+    # finally, we return the result dictionary
+    return result
+
+    
 # Get the data for the stock AAPL
-data = yf.download(COMPANY,TRAIN_START,TRAIN_END)
+data = process_data(COMPANY, TRAIN_START, TRAIN_END, test_ratio=0.2, n_steps=60, lookup_step=1)
 
+PRICE_VALUE = "Close"
+
+scaler = MinMaxScaler(feature_range=(0, 1)) 
+# Note that, by default, feature_range=(0, 1). Thus, if you want a different 
+# feature_range (min,max) then you'll need to specify it here
+scaled_data = scaler.fit_transform(data['df'][PRICE_VALUE].values.reshape(-1, 1)) 
 #------------------------------------------------------------------------------
 # Prepare Data
 ## To do:
@@ -58,33 +250,10 @@ data = yf.download(COMPANY,TRAIN_START,TRAIN_END)
 # 2) Use a different price value eg. mid-point of Open & Close
 # 3) Change the Prediction days
 #------------------------------------------------------------------------------
-PRICE_VALUE = "Close"
-
-scaler = MinMaxScaler(feature_range=(0, 1)) 
-# Note that, by default, feature_range=(0, 1). Thus, if you want a different 
-# feature_range (min,max) then you'll need to specify it here
-scaled_data = scaler.fit_transform(data[PRICE_VALUE].values.reshape(-1, 1)) 
-# Flatten and normalise the data
-# First, we reshape a 1D array(n) to 2D array(n,1)
-# We have to do that because sklearn.preprocessing.fit_transform()
-# requires a 2D array
-# Here n == len(scaled_data)
-# Then, we scale the whole array to the range (0,1)
-# The parameter -1 allows (np.)reshape to figure out the array size n automatically 
-# values.reshape(-1, 1) 
-# https://stackoverflow.com/questions/18691084/what-does-1-mean-in-numpy-reshape'
-# When reshaping an array, the new shape must contain the same number of elements 
-# as the old shape, meaning the products of the two shapes' dimensions must be equal. 
-# When using a -1, the dimension corresponding to the -1 will be the product of 
-# the dimensions of the original array divided by the product of the dimensions 
-# given to reshape so as to maintain the same number of elements.
-
-# Number of days to look back to base the prediction
-PREDICTION_DAYS = 60 # Original
-
-# To store the training data
 x_train = []
 y_train = []
+
+# Number of days to look back to base the prediction
 
 scaled_data = scaled_data[:,0] # Turn the 2D array back to a 1D array
 # Prepare the data
@@ -198,7 +367,7 @@ test_data = yf.download(COMPANY,TEST_START,TEST_END)
 
 actual_prices = test_data[PRICE_VALUE].values
 
-total_dataset = pd.concat((data[PRICE_VALUE], test_data[PRICE_VALUE]), axis=0)
+total_dataset = pd.concat((data['df'][PRICE_VALUE], test_data[PRICE_VALUE]), axis=0)
 
 model_inputs = total_dataset[len(total_dataset) - len(test_data) - PREDICTION_DAYS:].values
 # We need to do the above because to predict the closing price of the fisrt
