@@ -69,8 +69,14 @@ def shuffle_in_unison(a, b):
 def process_data(ticker,startDate, endDate, test_ratio, scale=True, split_by_date=True,shuffle=True,store=True,
                  feature_columns=['Close', 'Volume', 'Open', 'High', 'Low'], nan_strategy="drop"
                  , n_steps=50, lookup_step=1):
+    # first, we will initialize a list to hold all the sequences with n_steps length, accompanied with the target value
+    sequence_data = []
+    # initialize a deque to hold the past maximumly n_steps of data
+    sequences = deque(maxlen=n_steps)
     # create a dictionary to store the result
     result = {}
+    # construct the X's and y's
+    X, y = [], []
     #Check if startDate and endDate are provided, otherwise
     #it will raise an exception
     if startDate is None or endDate is None:
@@ -152,10 +158,6 @@ def process_data(ticker,startDate, endDate, test_ratio, scale=True, split_by_dat
     data.dropna(inplace=True)
     # After this step, we have finished some basic data preprocessing steps,
     # now we will deal with splitting the data to training and testing sets
-    # first, we will initialize a list to hold all the sequences with n_steps length, accompanied with the target value
-    sequence_data = []
-    # initialize a deque to hold the past maximumly n_steps of data
-    sequences = deque(maxlen=n_steps)
     # Now, we will loop through the data and create sequences of n_steps length
     # right here, we use zip to combine the feature columns and the future column together, for example one of the record will look like:
     # [131, 123, 182,192,800980, "2020-01-01"], 132. The first part is the feature columns with one value of date, and the second part is the target value
@@ -175,8 +177,6 @@ def process_data(ticker,startDate, endDate, test_ratio, scale=True, split_by_dat
     # this is the last sequence we will use to predict the future stock price that we will store it in the result dictionary
     result['last_sequence'] = last_sequence
     
-    # construct the X's and y's
-    X, y = [], []
     # append all the sequences and targets to the X and y lists
     for seq, target in sequence_data:
         X.append(seq)
