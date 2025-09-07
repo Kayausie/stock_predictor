@@ -23,6 +23,7 @@ import pandas_datareader as web
 import datetime as dt
 from sklearn import preprocessing
 import tensorflow as tf
+import datetime
 from collections import deque
 from sklearn.metrics import mean_absolute_error
 import sklearn.metrics as metrics
@@ -230,11 +231,149 @@ def process_data(ticker,startDate, endDate, test_ratio, scale=True, split_by_dat
     result["X_test"] = result["X_test"][:, :, :len(feature_columns)].astype(np.float32)
     # finally, we return the result dictionary
     return result
+def plot_financial_data(ticker,type="days", startDate="2023-07-02", endDate="2024-07-02", tradeDays=365):
+    if(type not in ["days, range"]):
+        raise ValueError("type must be one of: 'days', 'range'")
+    if isinstance(ticker, str):
+        #download the data using yfinance library
+        data = yf.download(ticker, period = f"{tradeDays}d")
+    elif isinstance(ticker, pd.DataFrame):
+        # use loaded data directly otherwise
+        data = ticker
+    else:
+        raise TypeError("ticker can be either a str or a `pd.DataFrame` instances")
+    if(type == "range"):
+        try:
+            datetime.date.fromisoformat(startDate)
+            datetime.date.fromisoformat(endDate)
+        except ValueError:
+            raise ValueError("Please provide a start date and end date in the format YYYY-MM-DD")
+def plot_candlestick_data(ticker,type="days", startDate="2023-07-02", endDate="2024-07-02", tradeDays=365):
+    if isinstance(ticker, str):
+        ticker = yf.Ticker(ticker)
+    if(type not in ["days", "range"]):
+        raise ValueError("type must be one of: 'days', 'range'")
+    if(type == "range"):
+        try:
+            datetime.date.fromisoformat(startDate)
+            datetime.date.fromisoformat(endDate)
+        except ValueError:
+            raise ValueError("Please provide a start date and end date in the format YYYY-MM-DD")
+    else:
+        # validate tradeDays, if the number typed is not a positive integer, raise an error. Otherwise, default to 365 days
+        if(not isinstance(tradeDays, int) or tradeDays <= 0):
+            raise ValueError("tradeDays must be a positive integer")
+    if isinstance(ticker, yf.Ticker):
+        #download the data using yfinance library, either with a range of dates or a number of days
+        if(type == "range"):
+            data = ticker.history( start=startDate, end=endDate)
+        else:
+            data = ticker.history( period = f"{tradeDays}d")
+    elif isinstance(ticker, pd.DataFrame):
+        # use loaded data directly otherwise
+        data = ticker
+    else:
+        raise TypeError("ticker can be either a str or a `pd.DataFrame` instances")
+    print(data)
+    data["Open"] = data["Open"].astype(float)
+    #Using mplfinance to plot the data
+    # fplt.plot(
+    #         data,
+    #         type='candle',
+    #         title='365 trading days ',
+    #         ylabel='Price ($)',
+    #         style='yahoo',
+    #     )
+    #Using plotly to plot the data
+    candlestick = go.Candlestick(
+                            x=data.index,
+                            open=data['Open'],
+                            high=data['High'],
+                            low=data['Low'],
+                            close=data['Close']
+                            )
+    fig = go.Figure(data=[candlestick])
+    fig.show()
+def plot_boxplot_data(ticker,type="days", startDate="2023-07-02", endDate="2024-07-02", tradeDays=365, day_range=5):
+    if isinstance(ticker, str):
+        ticker = yf.Ticker(ticker)
+    if(type not in ["days", "range"]):
+        raise ValueError("type must be one of: 'days', 'range'")
+    if(type == "range"):
+        try:
+            datetime.date.fromisoformat(startDate)
+            datetime.date.fromisoformat(endDate)
+        except ValueError:
+            raise ValueError("Please provide a start date and end date in the format YYYY-MM-DD")
+    else:
+        # validate tradeDays, if the number typed is not a positive integer, raise an error. Otherwise, default to 365 days
+        if(not isinstance(tradeDays, int) or tradeDays <= 0):
+            raise ValueError("tradeDays must be a positive integer")
+    if isinstance(ticker, yf.Ticker):
+        #download the data using yfinance library, either with a range of dates or a number of days
+        if(type == "range"):
+            data = ticker.history( start=startDate, end=endDate)
+        else:
+            data = ticker.history( period = f"{tradeDays}d")
+    elif isinstance(ticker, pd.DataFrame):
+        # use loaded data directly otherwise
+        data = ticker
+    else:
+        raise TypeError("ticker can be either a str or a `pd.DataFrame` instances")
+    data["dates"]=data.index
+    data["Open"] = data["Open"].astype(float)
+    print(data)
+    #create dataset for box plot of day_range
+    data_shown = pd.DataFrame(columns=["Date", "Open", "High", "Low", "Close"])
+    #Todo: create dataset for day_range
+    sequences = deque(maxlen=day_range)
+    for entry in data.values:
+        sequences.append(entry)
+        if len(sequences) == day_range:
+            temp_rec = {}
+            temp_rec["Date"] = sequences[0][7]
+            temp_rec["Open"] = sequences[0][0]
+            temp_rec["Close"] = sequences[4][3]
+            temp_rec["High"] = max([rec[1] for rec in sequences])
+            temp_rec["Low"] = min([rec[2] for rec in sequences])
+            data_shown = pd.concat([data_shown, pd.DataFrame([temp_rec])], ignore_index=True)
+            temp_rec.clear()
+            sequences.clear()
+    print(data_shown)
+    #Using plotly to plot the data
+    candlestick = go.Candlestick(
+                            x=data_shown['Date'],
+                            open=data_shown['Open'],
+                            high=data_shown['High'],
+                            low=data_shown['Low'],
+                            close=data_shown['Close']
+                            )
+    fig = go.Figure(data=[candlestick])
+    medians = (data_shown['High'] + data_shown['Low']) / 2
+     
+    half_span = pd.Timedelta(days= (day_range * 0.7/ 2.15)if day_range%2==1  else (day_range*0.7/2.1))
+# Loop over each candle, add a short horizontal line at the median
+    for xi, median in zip(data_shown["Date"], medians):
+        fig.add_shape(
+            type="line",
+            x0=xi - half_span,   # start a bit before the candle center
+            x1=xi + half_span,   # end a bit after the candle center
+            y0=median,
+            y1=median,
+            line=dict(color="firebrick", width=2)
+        )
+    fig.show()
+data = pd.DataFrame({
 
-    
+    "Date": ["2026-01-01","2026-01-06","2026-01-11"],
+    "q1":   [25,  30,  28],
+    "q3":   [75,  78,  80],
+    "median":[50,  55,  53],
+    "whislo":[10,  12,  11],
+    "whishi":[95, 100,  98],
+})
 # Get the data for the stock AAPL
 data = process_data(COMPANY, TRAIN_START, TRAIN_END, test_ratio=0.2, n_steps=60, lookup_step=1)
-
 PRICE_VALUE = "Close"
 
 scaler = MinMaxScaler(feature_range=(0, 1)) 
