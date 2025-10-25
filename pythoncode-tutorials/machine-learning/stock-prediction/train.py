@@ -2,6 +2,7 @@ from stock_prediction import create_model, load_data
 from tensorflow.keras.layers import LSTM
 from tensorflow.keras.callbacks import ModelCheckpoint, TensorBoard
 from tensorflow.keras.losses import Huber
+from tensorflow.keras.callbacks import ReduceLROnPlateau
 import os
 import pandas as pd
 from parameters import *
@@ -47,5 +48,8 @@ history = model.fit(data["X_train"], data["y_train"],
                     batch_size=BATCH_SIZE,
                     epochs=EPOCHS,
                     validation_data=(data["X_test"], data["y_test"]),
-                    callbacks=[checkpointer, tensorboard],
+                    callbacks=[checkpointer, 
+                               tensorboard,
+                               ReduceLROnPlateau(monitor="val_mae", factor=0.5, patience=5, min_lr=1e-5, verbose=1)
+                               ],
                     verbose=1)

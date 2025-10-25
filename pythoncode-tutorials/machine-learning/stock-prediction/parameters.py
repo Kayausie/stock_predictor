@@ -42,14 +42,13 @@ BIDIRECTIONAL = False
 # huber loss
 LOSS = "huber_loss"
 OPTIMIZER = "adam"
-BATCH_SIZE = 64
-EPOCHS = 500
+BATCH_SIZE = 128
+EPOCHS = 20
 
 # Amazon stock market
 ticker = "AMZN"
 ticker_data_filename = os.path.join("data", f"{ticker}_{date_now}.csv")
 # model name to save, making it as unique as possible based on parameters
-model_name = f"{date_now}_{ticker}-{shuffle_str}-{scale_str}-{split_by_date_str}-\
-{LOSS}-{OPTIMIZER}-{CELL.__name__}-seq-{N_STEPS}-step-{LOOKUP_STEP}-layers-{N_LAYERS}-units-{UNITS}"
+model_name = "mymodel"
 if BIDIRECTIONAL:
     model_name += "-b"

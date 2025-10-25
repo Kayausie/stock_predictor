@@ -47,6 +47,8 @@ def get_final_df(model, data):
     # sort the dataframe by date
     test_df.sort_index(inplace=True)
     final_df = test_df
+    print(test_df[f"true_adjclose_{LOOKUP_STEP}"])
+    print(data["test_df"]["adjclose"])
     # add the buy profit column
     final_df["buy_profit"] = list(map(buy_profit,
                                     final_df["adjclose"],
