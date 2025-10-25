@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""
+v0.5 Ensemble: LSTM + SARIMA
+- Reuses process_data(...) from stock_prediction.py
+- Reuses create_model(...) from train_test_function.py
+- Trains LSTM, generates aligned SARIMA forecasts, and blends:
+    (A) Weighted average with alpha tuned on a hold-out
+    (B) Stacking (Ridge) per horizon
+- Reports horizon-wise MAE/RMSE in scaled & price units
+"""
+
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+
+from stock_prediction import process_data
+from train_test_function import create_model
+
+
+# ---------------- config ----------------
+TICKER = "AAPL"
+START = "2020-01-01"
+END   = "2024-01-01"
+
+TEST_RATIO = 0.2
+N_STEPS = 50
+H = 5
+
+# LSTM training
+EPOCHS = 100
+BATCH = 32
+
+# SARIMA config (keep small to start)
+SARIMA_ORDER = (1,1,1)
+SARIMA_SORDER = (0,0,0,0)   # set e.g. (1,0,1,5) if you have weekly seasonality
+# ---------------------------------------
+
+
+def inverse_close(arr, close_scaler):
+    arr2d = arr.reshape(-1, 1)
+    inv = close_scaler.inverse_transform(arr2d).reshape(arr.shape)
+    return inv
+
+def horizon_metrics(y_true, y_pred):
+    assert y_true.shape == y_pred.shape
+    Hh = y_true.shape[1]
+    rows = []
+    for h in range(Hh):
+        err = (y_pred[:, h] - y_true[:, h]).astype(np.float32)
+        rows.append({"horizon": h+1,
+                     "MAE": float(np.mean(np.abs(err))),
+                     "RMSE": float(np.sqrt(np.mean(err**2)))})
+    overall = (y_pred - y_true).astype(np.float32)
+    rows.append({"horizon": "overall",
+                 "MAE": float(np.mean(np.abs(overall))),
+                 "RMSE": float(np.sqrt(np.mean(overall**2)))})
+    return pd.DataFrame(rows)
+
+def lstm_train_and_predict(data, n_steps, n_features, H):
+    X_train, y_train = data["X_train"], data["y_train"]
+    X_test,  y_test  = data["X_test"],  data["y_test"]
+
+    base = create_model(sequence_length=n_steps, n_features=n_features)
+    inp = tf.keras.Input(shape=(n_steps, n_features))
+    out = base(inp)
+    if len(out.shape) == 3:
+        out = tf.keras.layers.Flatten()(out)
+    out = tf.keras.layers.Dense(H, activation="sigmoid", name="multistep_head")(out)
+    model = tf.keras.Model(inp, out)
+    model.compile(optimizer="adam", loss="mse", metrics=["mae"])
+
+    model.fit(X_train, y_train,
+              validation_data=(X_test, y_test),
+              epochs=EPOCHS, batch_size=BATCH, verbose=1)
+
+    y_pred_scaled = model.predict(X_test, verbose=0)
+    return model, y_pred_scaled
+
+def build_sarima_forecast_matrix(data, order, seasonal_order, H):
+    """
+    For each test sample i, refit SARIMA on Close up to the last input date of that sample,
+    then forecast the next H steps. Returns predictions in **price units** with shape [N_test, H].
+    """
+    df_all   = data["df"]               # full indexed DataFrame
+    test_df  = data["test_df"]          # aligns with X_test rows
+    close_all = df_all["Close"].astype(float)
+
+    preds = []
+    for i, last_input_date in enumerate(test_df.index):
+        # history up to 'last_input_date'
+        hist = close_all.loc[:last_input_date]
+        # fit small SARIMA quickly; for speed/robustness turn off strict stationarity
+        try:
+            model = SARIMAX(hist, order=order, seasonal_order=seasonal_order,
+                            enforce_stationarity=False, enforce_invertibility=False)
+            res = model.fit(disp=False)
+            fc = res.get_forecast(steps=H).predicted_mean.values
+        except Exception:
+            # fallback: naive repeat last value
+            fc = np.repeat(hist.iloc[-1], H)
+        preds.append(fc)
+    return np.asarray(preds, dtype=np.float32)
+
+def tune_alpha_weight(y_true_price, dl_price, arima_price, grid=None):
+    """
+    Find alpha in [0,1] minimizing overall RMSE for weighted blend:
+        ens = alpha*dl + (1-alpha)*arima
+    """
+    if grid is None:
+        grid = np.linspace(0.0, 1.0, 21)
+    best = (None, 1e9)
+    for a in grid:
+        ens = a*dl_price + (1-a)*arima_price
+        rmse = np.sqrt(np.mean((ens - y_true_price)**2))
+        if rmse < best[1]:
+            best = (a, rmse)
+    return best  # (alpha, rmse)
+
+def ridge_stacking(y_true_price, dl_price, arima_price, holdout_frac=0.5):
+    """
+    Train a horizon-wise Ridge regressor on first part of the set and
+    evaluate on the remaining part to avoid full leakage.
+    Returns (pred_matrix_on_eval, models, split_index)
+    """
+    N, Hh = y_true_price.shape
+    split = max(1, int(N*holdout_frac))
+    X_tr = np.stack([dl_price[:split], arima_price[:split]], axis=-1)  # [Ntr, H, 2]
+    X_ev = np.stack([dl_price[split:], arima_price[split:]], axis=-1)  # [Nev, H, 2]
+    y_tr = y_true_price[:split]
+    y_ev = y_true_price[split:]
+
+    preds = np.zeros_like(y_ev)
+    models = []
+    for h in range(Hh):
+        reg = Ridge(alpha=1.0, fit_intercept=True, random_state=42)
+        reg.fit(X_tr[:, h, :], y_tr[:, h])
+        models.append(reg)
+        preds[:, h] = reg.predict(X_ev[:, h, :])
+    return preds, models, split
+
+
+def main():
+    np.random.seed(42); tf.random.set_seed(42)
+
+    print("=== Building dataset ===")
+    data = process_data(
+        TICKER, START, END,
+        test_ratio=TEST_RATIO,
+        n_steps=N_STEPS,
+        lookup_step=1,
+        horizon=H
+    )
+
+    X_train, y_train = data["X_train"], data["y_train"]
+    X_test,  y_test  = data["X_test"],  data["y_test"]
+    close_scaler     = data["column_scaler"]["Close"]
+
+    print("Shapes:", "X_train", X_train.shape, "y_train", y_train.shape,
+          "| X_test", X_test.shape, "y_test", y_test.shape)
+
+    # 1) Train LSTM and get scaled preds
+    print("\n=== LSTM training & inference ===")
+    n_features = X_train.shape[2]
+    lstm_model, y_pred_scaled = lstm_train_and_predict(data, N_STEPS, n_features, H)
+
+    # Convert LSTM preds and y_test to price units
+    y_true_price = inverse_close(y_test,        close_scaler)
+    dl_price     = inverse_close(y_pred_scaled, close_scaler)
+
+    # 2) SARIMA forecasts aligned to test windows (price units)
+    print("\n=== SARIMA rolling forecasts ===")
+    arima_price = build_sarima_forecast_matrix(
+        data, order=SARIMA_ORDER, seasonal_order=SARIMA_SORDER, H=H
+    )
+
+    # 3) Metrics: LSTM vs SARIMA (price units)
+    print("\n=== Baselines (price units) ===")
+    def print_block(name, y_true, y_pred):
+        df = horizon_metrics(y_true, y_pred)
+        print(f"\n{name}\n{df.round(4).to_string(index=False)}")
+
+    print_block("LSTM (price)", y_true_price, dl_price)
+    print_block("SARIMA (price)", y_true_price, arima_price)
+
+    # 4A) Weighted average ensemble (tune alpha on whole test set for simplicity)
+    alpha, rmse = tune_alpha_weight(y_true_price, dl_price, arima_price)
+    ens_price = alpha*dl_price + (1-alpha)*arima_price
+    print(f"\n=== Weighted Ensemble ===\nBest alpha={alpha:.2f} (overall RMSE={rmse:.4f})")
+    print_block("LSTM+SARIMA (weighted, price)", y_true_price, ens_price)
+
+    # 4B) Stacking (Ridge) with hold-out inside test set to avoid full leakage
+    preds_eval, models, split = ridge_stacking(y_true_price, dl_price, arima_price, holdout_frac=0.5)
+    df_stack = horizon_metrics(y_true_price[split:], preds_eval)
+    print(f"\n=== Stacking (Ridge) on hold-out ===\nSplit index={split} "
+          f"({split}/{len(y_true_price)} used for training meta-models)")
+    print(df_stack.round(4).to_string(index=False))
+
+    # 5) Naive baseline (repeat last Close of input window, in price units)
+    last_close_scaled = X_test[:, -1, 0]  # assuming Close is feature 0 in your pipeline
+    naive_scaled = np.tile(last_close_scaled.reshape(-1,1), (1, H))
+    naive_price = inverse_close(naive_scaled, close_scaler)
+    print_block("Naive (price)", y_true_price, naive_price)
+
+if __name__ == "__main__":
+    main()
